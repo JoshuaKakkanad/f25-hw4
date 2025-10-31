@@ -102,10 +102,15 @@ def lookup(target_name: dns.name.Name,
         CACHE[key] = empty
         return empty
 
-    nameservers = list(ROOT_SERVERS)
+    # use cached NS IPs for parent zone if available
+    zone = str(target_name.parent()).rstrip(".")
+    cached_ips = CACHE.get((zone, "NS_IPS"))
+    nameservers = list(cached_ips) if cached_ips else list(ROOT_SERVERS)
+
     tried = set()
 
     while True:
+        next_ns_ips = []  # reset each iteration
         for ns in nameservers:
             if ns in tried:
                 continue
@@ -123,19 +128,17 @@ def lookup(target_name: dns.name.Name,
                 for rrset in response.answer:
                     if rrset.rdtype == dns.rdatatype.CNAME:
                         cname_target = rrset[0].target
-                        # follow the alias recursively
                         final_response = lookup(cname_target, qtype, depth + 1)
-
                         merged = dns.message.make_response(query)
                         merged.answer = [rrset] + final_response.answer
                         CACHE[key] = merged
                         return merged
 
+                # Otherwise, just return the A/AAAA/MX answer directly
                 CACHE[key] = response
                 return response
 
-            # --- 2️⃣ Referral: try Additional section (glue) first ---
-            next_ns_ips = []
+            # --- 2️⃣ Referral: try Additional (glue) records first ---
             for rrset in response.additional:
                 if rrset.rdtype == dns.rdatatype.A:
                     for rr in rrset:
@@ -143,7 +146,7 @@ def lookup(target_name: dns.name.Name,
                         if ip not in next_ns_ips:
                             next_ns_ips.append(ip)
 
-            # --- 3️⃣ No glue: need to resolve NS hostnames ---
+            # --- 3️⃣ No glue: resolve NS hostnames from Authority ---
             if not next_ns_ips and response.authority:
                 ns_names = []
                 for rrset in response.authority:
@@ -154,7 +157,6 @@ def lookup(target_name: dns.name.Name,
                                 ns_names.append(ns_name)
 
                 for ns_name in ns_names:
-                    # Check if already cached
                     ns_resp = CACHE.get((ns_name, dns.rdatatype.A))
                     if not ns_resp:
                         ns_resp = lookup(dns.name.from_text(ns_name),
@@ -162,7 +164,6 @@ def lookup(target_name: dns.name.Name,
                                          depth + 1)
                         CACHE[(ns_name, dns.rdatatype.A)] = ns_resp
 
-                    # extract resolved IPs
                     for rrset in ns_resp.answer:
                         if rrset.rdtype == dns.rdatatype.A:
                             for rr in rrset:
@@ -170,7 +171,7 @@ def lookup(target_name: dns.name.Name,
                                 if ip not in next_ns_ips:
                                     next_ns_ips.append(ip)
 
-            # --- 4️⃣ Cache intermediate NS → IPs for future use ---
+            # --- 4️⃣ Cache intermediate NS → IPs for reuse ---
             if response.authority:
                 for rrset in response.authority:
                     if rrset.rdtype == dns.rdatatype.NS:
@@ -181,10 +182,16 @@ def lookup(target_name: dns.name.Name,
 
             # --- 5️⃣ Go deeper if we found more nameservers ---
             if next_ns_ips:
-                nameservers = next_ns_ips
+                nameservers = list(dict.fromkeys(next_ns_ips))  # remove duplicates
                 break  # go another round of resolution
 
-            # --- 6️⃣ Failsafe: prevent endless retry ---
+            # --- 6️⃣ No progress → stop recursion ---
+            if not next_ns_ips and len(tried) == len(nameservers):
+                empty = dns.message.make_response(query)
+                CACHE[key] = empty
+                return empty
+
+            # --- 7️⃣ Safety cap ---
             if len(tried) > 30:
                 empty = dns.message.make_response(query)
                 CACHE[key] = empty
@@ -195,6 +202,7 @@ def lookup(target_name: dns.name.Name,
             empty = dns.message.make_response(query)
             CACHE[key] = empty
             return empty
+
 
 
 def print_results(results: dict) -> None:
