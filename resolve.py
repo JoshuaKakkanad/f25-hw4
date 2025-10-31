@@ -126,13 +126,10 @@ def lookup(target_name: dns.name.Name,
                     # Handle CNAMEs
                     if rrset.rdtype == dns.rdatatype.CNAME:
                         cname_target = rrset[0].target
-                        # recursively resolve the target
-                        cname_response = lookup(cname_target, qtype)
-                        merged = dns.message.make_response(query)
-                        merged.answer.extend(response.answer)
-                        merged.answer.extend(cname_response.answer)
-                        CACHE[key] = merged
-                        return merged
+                        # Cache the CNAME relationship for print_results()
+                        CACHE[(str(target_name), dns.rdatatype.CNAME)] = response
+                        # Restart lookup for the true target — no merge needed here
+                        return lookup(cname_target, qtype)
 
 
                 CACHE[key] = response
@@ -184,9 +181,15 @@ def lookup(target_name: dns.name.Name,
                                 if ":" not in ipv4 and ipv4 not in next_ns_ips:
                                     next_ns_ips.append(ipv4)
 
+                if not next_ns_ips:
+                    nameservers = list(ROOT_SERVERS)
+                    break
+
             # --- Cache intermediate results ---
-            for rrset in response.authority + response.additional:
-                CACHE[(str(rrset.name), rrset.rdtype)] = response
+            for rrset in response.additional:
+                if rrset.rdtype == dns.rdatatype.A:
+                    for rr in rrset:
+                        CACHE[(str(rrset.name), dns.rdatatype.A)] = rr
 
             # --- Move forward ---
             if next_ns_ips:
