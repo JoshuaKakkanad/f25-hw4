@@ -31,6 +31,7 @@ ROOT_SERVERS = ("198.41.0.4",
                 "199.7.83.42",
                 "202.12.27.33")
 
+_LAST_NAMESERVERS = list(ROOT_SERVERS)
 
 def collect_results(name: str) -> dict:
     """
@@ -88,13 +89,16 @@ CACHE = {}
 def lookup(target_name: dns.name.Name,
            qtype: dns.rdata.Rdata) -> dns.message.Message:
     """
-    Recursive DNS resolver with caching of both final and intermediate results.
+    Recursive DNS resolver with smarter caching and reduced restarts.
     """
+    global _LAST_NAMESERVERS
+
     key = (str(target_name), qtype)
     if key in CACHE:
         return CACHE[key]
 
-    nameservers = list(ROOT_SERVERS)
+    # Use last known working servers instead of restarting from root
+    nameservers = list(_LAST_NAMESERVERS)
     tried = set()
 
     while nameservers:
@@ -111,9 +115,13 @@ def lookup(target_name: dns.name.Name,
 
             # --- Case 1: direct answer ---
             if response.answer:
+                _LAST_NAMESERVERS = [ns]
                 for rrset in response.answer:
+                    # Handle CNAMEs
                     if rrset.rdtype == dns.rdatatype.CNAME:
                         cname_target = rrset[0].target
+                        # Cache the CNAME relationship
+                        CACHE[(str(target_name), dns.rdatatype.CNAME)] = response
                         final_resp = lookup(cname_target, qtype)
                         final_resp.answer = response.answer + final_resp.answer
                         CACHE[key] = final_resp
@@ -143,15 +151,23 @@ def lookup(target_name: dns.name.Name,
 
                 for ns_name in ns_names:
                     ns_key = (ns_name, dns.rdatatype.A)
+                    # ✅ Use cache if we’ve seen this NS recently
                     if ns_key in CACHE:
                         ns_resp = CACHE[ns_key]
                     else:
+                        # ✅ Don’t restart from root — reuse last known servers
+                        saved_ns = list(_LAST_NAMESERVERS)
+                        _LAST_NAMESERVERS = nameservers
                         try:
                             ns_resp = lookup(dns.name.from_text(ns_name),
                                              dns.rdatatype.A)
                             CACHE[ns_key] = ns_resp
                         except Exception:
                             continue
+                        finally:
+                            _LAST_NAMESERVERS = saved_ns  # restore context
+
+                    # Collect resolved A records
                     for rrset in ns_resp.answer:
                         if rrset.rdtype == dns.rdatatype.A:
                             for rr in rrset:
@@ -159,20 +175,24 @@ def lookup(target_name: dns.name.Name,
                                 if ":" not in ipv4 and ipv4 not in next_ns_ips:
                                     next_ns_ips.append(ipv4)
 
+            # --- Cache intermediate results ---
             for rrset in response.authority + response.additional:
                 for rr in rrset:
                     CACHE[(str(rrset.name), rrset.rdtype)] = response
 
-            # --- move down the chain ---
+            # --- Move forward ---
             if next_ns_ips:
+                _LAST_NAMESERVERS = list(next_ns_ips)
                 nameservers = next_ns_ips
                 break
         else:
             break
 
+    # --- Fallback empty response ---
     empty = dns.message.make_response(dns.message.make_query(target_name, qtype))
     CACHE[key] = empty
     return empty
+
 
 def print_results(results: dict) -> None:
     """
