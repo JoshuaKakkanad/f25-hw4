@@ -159,6 +159,10 @@ def lookup(target_name: dns.name.Name,
                                 if ":" not in ipv4 and ipv4 not in next_ns_ips:
                                     next_ns_ips.append(ipv4)
 
+            for rrset in response.authority + response.additional:
+                for rr in rrset:
+                    CACHE[(str(rrset.name), rrset.rdtype)] = response
+
             # --- move down the chain ---
             if next_ns_ips:
                 nameservers = next_ns_ips
@@ -166,13 +170,9 @@ def lookup(target_name: dns.name.Name,
         else:
             break
 
-    # --- no result ---
     empty = dns.message.make_response(dns.message.make_query(target_name, qtype))
     CACHE[key] = empty
     return empty
-
-
-
 
 def print_results(results: dict) -> None:
     """
