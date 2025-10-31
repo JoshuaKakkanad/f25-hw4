@@ -98,7 +98,7 @@ def lookup(target_name: dns.name.Name,
     if key in CACHE:
         return CACHE[key]
 
-    # --- NEW: Try to reuse cached NS delegation for parent zone ---
+    # --- NEW: Try to reuse cached NS records for parent zones ---
     parent = target_name
     while parent.labels:
         parent = parent.parent()
@@ -106,7 +106,7 @@ def lookup(target_name: dns.name.Name,
         if ns_key in CACHE:
             ns_resp = CACHE[ns_key]
             next_ns_ips = []
-            for rrset in ns_resp.authority:
+            for rrset in getattr(ns_resp, "authority", []):
                 if rrset.rdtype == dns.rdatatype.NS:
                     for rr in rrset:
                         ns_name = str(rr.target)
@@ -154,9 +154,7 @@ def lookup(target_name: dns.name.Name,
                     # --- Handle CNAME Restart ---
                     if rrset.rdtype == dns.rdatatype.CNAME:
                         cname_target = rrset[0].target
-                        # Resolve alias recursively for same qtype
                         cname_response = lookup(cname_target, qtype)
-                        # Also get A and AAAA for alias to match host output
                         a_response = lookup(cname_target, dns.rdatatype.A)
                         aaaa_response = lookup(cname_target, dns.rdatatype.AAAA)
 
@@ -239,7 +237,6 @@ def lookup(target_name: dns.name.Name,
     empty = dns.message.make_response(dns.message.make_query(target_name, qtype))
     CACHE[key] = empty
     return empty
-
 
 
 
