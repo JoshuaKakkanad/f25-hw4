@@ -90,7 +90,7 @@ def lookup(target_name: dns.name.Name,
            qtype: dns.rdata.Rdata) -> dns.message.Message:
     """
     Recursive DNS resolver with caching, CNAME handling, unglued NS resolution,
-    and intermediate caching (reuses cached NS delegations).
+    and intermediate caching for efficiency.
     """
     global _LAST_NAMESERVERS
 
@@ -98,8 +98,7 @@ def lookup(target_name: dns.name.Name,
     if key in CACHE:
         return CACHE[key]
 
-    # --- NEW: Try to reuse cached NS delegations (intermediate caching) ---
-    nameservers = list(_LAST_NAMESERVERS)
+    # --- NEW: Try to reuse cached NS delegation for parent zone ---
     parent = target_name
     while parent.labels:
         parent = parent.parent()
@@ -107,7 +106,6 @@ def lookup(target_name: dns.name.Name,
         if ns_key in CACHE:
             ns_resp = CACHE[ns_key]
             next_ns_ips = []
-            # Look up cached A records for each NS in this delegation
             for rrset in ns_resp.authority:
                 if rrset.rdtype == dns.rdatatype.NS:
                     for rr in rrset:
@@ -121,14 +119,12 @@ def lookup(target_name: dns.name.Name,
                                         ipv4 = str(rr2)
                                         if ":" not in ipv4 and ipv4 not in next_ns_ips:
                                             next_ns_ips.append(ipv4)
-            # If we found usable IPs for this zone, reuse them
             if next_ns_ips:
                 _LAST_NAMESERVERS = list(next_ns_ips)
-                nameservers = list(next_ns_ips)
                 break
-    else:
-        nameservers = list(_LAST_NAMESERVERS)
+    # --- END NEW BLOCK ---
 
+    nameservers = list(_LAST_NAMESERVERS)
     tried = set()
     fail_count = 0
     MAX_FAILS = 4
