@@ -82,126 +82,125 @@ def collect_results(name: str) -> dict:
     return full_response
 
 
+# Global cache for answers and intermediate results
 CACHE = {}
 
-def lookup(target_name: dns.name.Name,
-           qtype: dns.rdata.Rdata,
-           depth: int = 0) -> dns.message.Message:
+def lookup(target_name: dns.name.Name, qtype: dns.rdata.Rdata) -> dns.message.Message:
     """
-    Recursive DNS resolver using only provided dnspython modules.
-    Fully handles CNAMEs, unglued NS, caching, and error handling.
+    A fully recursive DNS resolver that starts from root servers and resolves
+    the given name without using any recursive resolver.
+    Includes caching, CNAME handling, and timeout/error handling.
     """
 
-    key = (str(target_name).rstrip("."), qtype)
-    if key in CACHE:
-        return CACHE[key]
+    def cached_lookup(name_text, qtype_val):
+        key = (name_text.lower(), qtype_val)
+        return CACHE.get(key)
 
-    # prevent runaway recursion
-    if depth > 20:
-        empty = dns.message.make_response(dns.message.make_query(target_name, qtype))
-        CACHE[key] = empty
-        return empty
+    def cache_store(name_text, qtype_val, response):
+        key = (name_text.lower(), qtype_val)
+        CACHE[key] = response
 
-    # use cached NS IPs for parent zone if available
-    zone = str(target_name.parent()).rstrip(".")
-    cached_ips = CACHE.get((zone, "NS_IPS"))
-    nameservers = list(cached_ips) if cached_ips else list(ROOT_SERVERS)
+    def send_query(server_ip, qname, qtype_val):
+        try:
+            query = dns.message.make_query(qname, qtype_val)
+            return dns.query.udp(query, server_ip, timeout=3)
+        except Exception:
+            return None
 
-    tried = set()
+    def extract_ns_ips(response):
+        """Extract NS target names and any glue A records if available."""
+        ns_names = []
+        glue_ips = {}
+        for rrset in response.authority:
+            if rrset.rdtype == dns.rdatatype.NS:
+                for rr in rrset:
+                    ns_names.append(str(rr.target).rstrip("."))
+        for rrset in response.additional:
+            if rrset.rdtype == dns.rdatatype.A:
+                glue_ips[str(rrset.name).rstrip(".")] = [str(rr.address) for rr in rrset]
+        return ns_names, glue_ips
 
-    while True:
-        next_ns_ips = []  # reset each iteration
-        for ns in nameservers:
-            if ns in tried:
-                continue
-            tried.add(ns)
-
-            query = dns.message.make_query(target_name, qtype)
-            try:
-                response = dns.query.udp(query, ns, timeout=3)
-            except Exception:
-                continue
-
-            # --- 1️⃣ Direct Answer ---
-            if response.answer:
-                # Handle CNAME recursion properly
-                for rrset in response.answer:
-                    if rrset.rdtype == dns.rdatatype.CNAME:
-                        cname_target = rrset[0].target
-                        final_response = lookup(cname_target, qtype, depth + 1)
-                        merged = dns.message.make_response(query)
-                        merged.answer = [rrset] + final_response.answer
-                        CACHE[key] = merged
-                        return merged
-
-                # Otherwise, just return the A/AAAA/MX answer directly
-                CACHE[key] = response
-                return response
-
-            # --- 2️⃣ Referral: try Additional (glue) records first ---
-            for rrset in response.additional:
+    def resolve_ns_ip(ns_name):
+        """Resolve the A record for a nameserver (unglued)."""
+        if (ns_name.lower(), dns.rdatatype.A) in CACHE:
+            resp = CACHE[(ns_name.lower(), dns.rdatatype.A)]
+            if resp.answer:
+                for rrset in resp.answer:
+                    if rrset.rdtype == dns.rdatatype.A:
+                        return [str(rr.address) for rr in rrset]
+        # Resolve recursively
+        ns_resp = lookup(dns.name.from_text(ns_name), dns.rdatatype.A)
+        if ns_resp and ns_resp.answer:
+            for rrset in ns_resp.answer:
                 if rrset.rdtype == dns.rdatatype.A:
-                    for rr in rrset:
-                        ip = str(rr)
-                        if ip not in next_ns_ips:
-                            next_ns_ips.append(ip)
+                    return [str(rr.address) for rr in rrset]
+        return []
 
-            # --- 3️⃣ No glue: resolve NS hostnames from Authority ---
-            if not next_ns_ips and response.authority:
-                ns_names = []
-                for rrset in response.authority:
-                    if rrset.rdtype == dns.rdatatype.NS:
-                        for rr in rrset:
-                            ns_name = str(rr.target).rstrip(".")
-                            if ns_name not in ns_names:
-                                ns_names.append(ns_name)
+    def recursive_resolve(name_obj, qtype_val):
+        name_text = str(name_obj).rstrip(".")
+        cached = cached_lookup(name_text, qtype_val)
+        if cached:
+            return cached
 
-                for ns_name in ns_names:
-                    ns_resp = CACHE.get((ns_name, dns.rdatatype.A))
-                    if not ns_resp:
-                        ns_resp = lookup(dns.name.from_text(ns_name),
-                                         dns.rdatatype.A,
-                                         depth + 1)
-                        CACHE[(ns_name, dns.rdatatype.A)] = ns_resp
+        # start from roots
+        next_servers = list(ROOT_SERVERS)
 
-                    for rrset in ns_resp.answer:
-                        if rrset.rdtype == dns.rdatatype.A:
-                            for rr in rrset:
-                                ip = str(rr)
-                                if ip not in next_ns_ips:
-                                    next_ns_ips.append(ip)
+        while True:
+            found_response = None
+            for server in next_servers:
+                response = send_query(server, name_obj, qtype_val)
+                if response is None:
+                    continue
 
-            # --- 4️⃣ Cache intermediate NS → IPs for reuse ---
-            if response.authority:
-                for rrset in response.authority:
-                    if rrset.rdtype == dns.rdatatype.NS:
-                        zone = str(target_name.parent()).rstrip(".")
-                        CACHE.setdefault((zone, "NS"), set()).add(str(rr.target).rstrip("."))
-                        if next_ns_ips:
-                            CACHE[(zone, "NS_IPS")] = next_ns_ips
+                # if we got an answer, check if it’s final
+                if response.answer:
+                    found_response = response
+                    break
 
-            # --- 5️⃣ Go deeper if we found more nameservers ---
-            if next_ns_ips:
-                nameservers = list(dict.fromkeys(next_ns_ips))  # remove duplicates
-                break  # go another round of resolution
+                # otherwise, get new NS
+                ns_names, glue_ips = extract_ns_ips(response)
+                if not ns_names:
+                    continue
 
-            # --- 6️⃣ No progress → stop recursion ---
-            if not next_ns_ips and len(tried) == len(nameservers):
-                empty = dns.message.make_response(query)
-                CACHE[key] = empty
-                return empty
+                new_servers = []
+                for ns in ns_names:
+                    if ns in glue_ips:
+                        new_servers.extend(glue_ips[ns])
+                    else:
+                        resolved_ips = resolve_ns_ip(ns)
+                        new_servers.extend(resolved_ips)
+                if new_servers:
+                    next_servers = new_servers
+                    break
+            else:
+                # if no servers responded
+                return dns.message.make_response(dns.message.make_query(name_obj, qtype_val))
 
-            # --- 7️⃣ Safety cap ---
-            if len(tried) > 30:
-                empty = dns.message.make_response(query)
-                CACHE[key] = empty
-                return empty
+            if found_response:
+                # handle CNAME restarts
+                cname_target = None
+                for rrset in found_response.answer:
+                    if rrset.rdtype == dns.rdatatype.CNAME:
+                        cname_target = str(rrset[0].target)
+                        cname_resp = recursive_resolve(dns.name.from_text(cname_target), qtype_val)
+                        # merge CNAME chain + final answer
+                        combined = dns.message.make_response(
+                            dns.message.make_query(name_obj, qtype_val)
+                        )
+                        combined.answer = found_response.answer + cname_resp.answer
+                        cache_store(name_text, qtype_val, combined)
+                        return combined
 
-        else:
-            # all nameservers exhausted
-            empty = dns.message.make_response(query)
-            CACHE[key] = empty
-            return empty
+                # cache and return
+                cache_store(name_text, qtype_val, found_response)
+                return found_response
+
+    # main recursive call
+    try:
+        return recursive_resolve(target_name, qtype)
+    except Exception:
+        # graceful failure (never crash)
+        return dns.message.make_response(dns.message.make_query(target_name, qtype))
 
 
 
