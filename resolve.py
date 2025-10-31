@@ -89,7 +89,8 @@ CACHE = {}
 def lookup(target_name: dns.name.Name,
            qtype: dns.rdata.Rdata) -> dns.message.Message:
     """
-    Recursive DNS resolver with caching and proper CNAME + referral handling.
+    Recursive DNS resolver with caching, CNAME handling, unglued NS resolution,
+    and intermediate caching for efficiency.
     """
     global _LAST_NAMESERVERS
 
@@ -111,7 +112,7 @@ def lookup(target_name: dns.name.Name,
             try:
                 query = dns.message.make_query(target_name, qtype)
                 response = dns.query.udp(query, ns, timeout=3)
-                fail_count = 0  # reset after a successful query
+                fail_count = 0
             except Exception:
                 fail_count += 1
                 if fail_count >= MAX_FAILS:
@@ -120,27 +121,36 @@ def lookup(target_name: dns.name.Name,
                     fail_count = 0
                 continue
 
-            # --- Case 1: Direct answer ---
+            # --- Case 1: Direct Answer ---
             if response.answer:
                 _LAST_NAMESERVERS = [ns]
                 for rrset in response.answer:
+                    # --- Handle CNAME Restart ---
                     if rrset.rdtype == dns.rdatatype.CNAME:
                         cname_target = rrset[0].target
-                        # Resolve the alias target
+                        # Resolve alias recursively for same qtype
                         cname_response = lookup(cname_target, qtype)
-                        # Merge alias + resolved data
+                        # Also get A and AAAA for alias to match host output
+                        a_response = lookup(cname_target, dns.rdatatype.A)
+                        aaaa_response = lookup(cname_target, dns.rdatatype.AAAA)
+
                         merged = dns.message.make_response(query)
                         merged.answer.extend(response.answer)
                         merged.answer.extend(cname_response.answer)
-                        # Cache both CNAME and merged response
+                        merged.answer.extend(a_response.answer)
+                        merged.answer.extend(aaaa_response.answer)
+
                         CACHE[(str(target_name), dns.rdatatype.CNAME)] = response
                         CACHE[key] = merged
                         return merged
+
                 CACHE[key] = response
                 return response
 
-            # --- Case 2: Referral with glue ---
+            # --- Case 2: Referral (with or without glue) ---
             next_ns_ips = []
+
+            # Collect glue (A records in additional)
             for rrset in response.additional:
                 if rrset.rdtype == dns.rdatatype.A:
                     for rr in rrset:
@@ -149,31 +159,29 @@ def lookup(target_name: dns.name.Name,
                             next_ns_ips.append(ipv4)
                             CACHE[(str(rrset.name), dns.rdatatype.A)] = rr
 
-            # --- Case 3: Referral without glue ---
-            if not next_ns_ips and response.authority:
-                ns_names = []
-                for rrset in response.authority:
-                    if rrset.rdtype == dns.rdatatype.NS:
-                        for rr in rrset:
-                            ns_name = str(rr.target)
-                            if ns_name not in ns_names:
-                                ns_names.append(ns_name)
+            # Collect NS names if no glue provided
+            ns_names = []
+            for rrset in response.authority:
+                if rrset.rdtype == dns.rdatatype.NS:
+                    for rr in rrset:
+                        ns_name = str(rr.target)
+                        if ns_name not in ns_names:
+                            ns_names.append(ns_name)
+                    # Cache delegation info (intermediate caching)
+                    CACHE[(str(rrset.name), dns.rdatatype.NS)] = response
 
+            # Resolve unglued NS to A records
+            if not next_ns_ips and ns_names:
                 for ns_name in ns_names:
                     ns_key = (ns_name, dns.rdatatype.A)
                     if ns_key in CACHE:
                         ns_resp = CACHE[ns_key]
                     else:
-                        saved_ns = list(_LAST_NAMESERVERS)
-                        _LAST_NAMESERVERS = nameservers
                         try:
-                            ns_resp = lookup(dns.name.from_text(ns_name),
-                                             dns.rdatatype.A)
+                            ns_resp = lookup(dns.name.from_text(ns_name), dns.rdatatype.A)
                             CACHE[ns_key] = ns_resp
                         except Exception:
                             continue
-                        finally:
-                            _LAST_NAMESERVERS = saved_ns
 
                     for rrset in getattr(ns_resp, "answer", []):
                         if rrset.rdtype == dns.rdatatype.A:
@@ -182,30 +190,30 @@ def lookup(target_name: dns.name.Name,
                                 if ":" not in ipv4 and ipv4 not in next_ns_ips:
                                     next_ns_ips.append(ipv4)
 
-                # If still no usable NS IPs, restart from root
-                if not next_ns_ips:
-                    _LAST_NAMESERVERS = list(ROOT_SERVERS)
-                    nameservers = list(ROOT_SERVERS)
-                    break
+            # If no next NS IPs found, restart from roots
+            if not next_ns_ips:
+                _LAST_NAMESERVERS = list(ROOT_SERVERS)
+                nameservers = list(ROOT_SERVERS)
+                break
 
-            # --- Cache intermediate glue results ---
+            # Cache intermediate glue results
             for rrset in response.additional:
                 if rrset.rdtype == dns.rdatatype.A:
                     for rr in rrset:
                         CACHE[(str(rrset.name), dns.rdatatype.A)] = rr
 
-            # --- Move forward ---
-            if next_ns_ips:
-                _LAST_NAMESERVERS = list(next_ns_ips)
-                nameservers = next_ns_ips
-                break
+            # Continue recursion to next layer
+            _LAST_NAMESERVERS = list(next_ns_ips)
+            nameservers = next_ns_ips
+            break
         else:
             break
 
-    # --- Fallback empty response ---
+    # --- Fallback Empty Response ---
     empty = dns.message.make_response(dns.message.make_query(target_name, qtype))
     CACHE[key] = empty
     return empty
+
 
 
 
