@@ -100,6 +100,8 @@ def lookup(target_name: dns.name.Name,
     # Use last known working servers instead of restarting from root
     nameservers = list(_LAST_NAMESERVERS)
     tried = set()
+    fail_count = 0
+    MAX_FAILS = 4
 
     while nameservers:
         for ns in nameservers:
@@ -111,6 +113,10 @@ def lookup(target_name: dns.name.Name,
                 query = dns.message.make_query(target_name, qtype)
                 response = dns.query.udp(query, ns, timeout=3)
             except Exception:
+                fail_count += 1
+                if fail_count >= MAX_FAILS:
+                    nameservers = list(ROOT_SERVERS)
+                    fail_count = 0
                 continue
 
             # --- Case 1: direct answer ---
@@ -122,11 +128,12 @@ def lookup(target_name: dns.name.Name,
                         cname_target = rrset[0].target
                         # recursively resolve the target
                         cname_response = lookup(cname_target, qtype)
-                        # combine current CNAME answer + resolved data
                         merged = dns.message.make_response(query)
-                        merged.answer = response.answer + cname_response.answer
+                        merged.answer.extend(response.answer)
+                        merged.answer.extend(cname_response.answer)
                         CACHE[key] = merged
                         return merged
+
 
                 CACHE[key] = response
                 return response
@@ -180,8 +187,6 @@ def lookup(target_name: dns.name.Name,
             # --- Cache intermediate results ---
             for rrset in response.authority + response.additional:
                 CACHE[(str(rrset.name), rrset.rdtype)] = response
-                for rr in rrset:
-                    CACHE[(str(rrset.name), rrset.rdtype)] = response
 
             # --- Move forward ---
             if next_ns_ips:
