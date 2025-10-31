@@ -90,7 +90,7 @@ def lookup(target_name: dns.name.Name,
            qtype: dns.rdata.Rdata) -> dns.message.Message:
     """
     Recursive DNS resolver with caching, CNAME handling, unglued NS resolution,
-    and intermediate caching for efficiency.
+    and intermediate caching (reuses cached NS delegations).
     """
     global _LAST_NAMESERVERS
 
@@ -98,7 +98,37 @@ def lookup(target_name: dns.name.Name,
     if key in CACHE:
         return CACHE[key]
 
+    # --- NEW: Try to reuse cached NS delegations (intermediate caching) ---
     nameservers = list(_LAST_NAMESERVERS)
+    parent = target_name
+    while parent.labels:
+        parent = parent.parent()
+        ns_key = (str(parent), dns.rdatatype.NS)
+        if ns_key in CACHE:
+            ns_resp = CACHE[ns_key]
+            next_ns_ips = []
+            # Look up cached A records for each NS in this delegation
+            for rrset in ns_resp.authority:
+                if rrset.rdtype == dns.rdatatype.NS:
+                    for rr in rrset:
+                        ns_name = str(rr.target)
+                        a_key = (ns_name, dns.rdatatype.A)
+                        if a_key in CACHE:
+                            a_resp = CACHE[a_key]
+                            for aset in getattr(a_resp, "answer", []):
+                                if aset.rdtype == dns.rdatatype.A:
+                                    for rr2 in aset:
+                                        ipv4 = str(rr2)
+                                        if ":" not in ipv4 and ipv4 not in next_ns_ips:
+                                            next_ns_ips.append(ipv4)
+            # If we found usable IPs for this zone, reuse them
+            if next_ns_ips:
+                _LAST_NAMESERVERS = list(next_ns_ips)
+                nameservers = list(next_ns_ips)
+                break
+    else:
+        nameservers = list(_LAST_NAMESERVERS)
+
     tried = set()
     fail_count = 0
     MAX_FAILS = 4
@@ -213,6 +243,7 @@ def lookup(target_name: dns.name.Name,
     empty = dns.message.make_response(dns.message.make_query(target_name, qtype))
     CACHE[key] = empty
     return empty
+
 
 
 
