@@ -120,12 +120,14 @@ def lookup(target_name: dns.name.Name,
                     # Handle CNAMEs
                     if rrset.rdtype == dns.rdatatype.CNAME:
                         cname_target = rrset[0].target
-                        # Cache the CNAME relationship
-                        CACHE[(str(target_name), dns.rdatatype.CNAME)] = response
-                        final_resp = lookup(cname_target, qtype)
-                        final_resp.answer = response.answer + final_resp.answer
-                        CACHE[key] = final_resp
-                        return final_resp
+                        # recursively resolve the target
+                        cname_response = lookup(cname_target, qtype)
+                        # combine current CNAME answer + resolved data
+                        merged = dns.message.make_response(query)
+                        merged.answer = response.answer + cname_response.answer
+                        CACHE[key] = merged
+                        return merged
+
                 CACHE[key] = response
                 return response
 
@@ -177,6 +179,7 @@ def lookup(target_name: dns.name.Name,
 
             # --- Cache intermediate results ---
             for rrset in response.authority + response.additional:
+                CACHE[(str(rrset.name), rrset.rdtype)] = response
                 for rr in rrset:
                     CACHE[(str(rrset.name), rrset.rdtype)] = response
 
