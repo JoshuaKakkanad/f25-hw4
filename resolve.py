@@ -85,18 +85,25 @@ def collect_results(name: str) -> dict:
 CACHE = {}
 
 def lookup(target_name: dns.name.Name,
-           qtype: dns.rdata.Rdata) -> dns.message.Message:
+           qtype: dns.rdata.Rdata,
+           depth: int = 0) -> dns.message.Message:
     """
     Recursive DNS resolver using only provided dnspython modules.
     Fully handles CNAMEs, unglued NS, caching, and error handling.
     """
-    key = (str(target_name), qtype)
+
+    key = (str(target_name).rstrip("."), qtype)
     if key in CACHE:
         return CACHE[key]
 
+    # prevent runaway recursion
+    if depth > 20:
+        empty = dns.message.make_response(dns.message.make_query(target_name, qtype))
+        CACHE[key] = empty
+        return empty
+
     nameservers = list(ROOT_SERVERS)
     tried = set()
-    cname_chain = []  # Keep track of aliases for proper CNAME printing
 
     while True:
         for ns in nameservers:
@@ -110,84 +117,81 @@ def lookup(target_name: dns.name.Name,
             except Exception:
                 continue
 
-            # --- Direct answer ---
+            # --- 1️⃣ Direct Answer ---
             if response.answer:
-                CACHE[key] = response
-
-                # Handle CNAME chains properly
+                # Handle CNAME recursion properly
                 for rrset in response.answer:
                     if rrset.rdtype == dns.rdatatype.CNAME:
                         cname_target = rrset[0].target
-                        cname_chain.append((str(target_name), str(cname_target)))
+                        # follow the alias recursively
+                        final_response = lookup(cname_target, qtype, depth + 1)
 
-                        # recursively resolve the CNAME target
-                        final_response = lookup(cname_target, qtype)
-
-                        # merge the CNAME chain into the returned response
                         merged = dns.message.make_response(query)
-                        merged.answer = rrset.answer if hasattr(rrset, "answer") else []
-                        merged.answer.extend(final_response.answer)
-                        CACHE[key] = response
-                        return response
+                        merged.answer = [rrset] + final_response.answer
+                        CACHE[key] = merged
+                        return merged
 
+                CACHE[key] = response
                 return response
 
-            # --- Referral: check Additional for glue ---
+            # --- 2️⃣ Referral: try Additional section (glue) first ---
             next_ns_ips = []
             for rrset in response.additional:
                 if rrset.rdtype == dns.rdatatype.A:
                     for rr in rrset:
-                        ipv4 = str(rr)
-                        if ipv4 and ":" not in ipv4 and ipv4 not in next_ns_ips:
-                            next_ns_ips.append(ipv4)
+                        ip = str(rr)
+                        if ip not in next_ns_ips:
+                            next_ns_ips.append(ip)
 
-            # --- No glue: resolve NS names in Authority ---
+            # --- 3️⃣ No glue: need to resolve NS hostnames ---
             if not next_ns_ips and response.authority:
                 ns_names = []
                 for rrset in response.authority:
                     if rrset.rdtype == dns.rdatatype.NS:
                         for rr in rrset:
-                            ns_name = str(rr.target)
+                            ns_name = str(rr.target).rstrip(".")
                             if ns_name not in ns_names:
                                 ns_names.append(ns_name)
 
                 for ns_name in ns_names:
-                    # Reuse cached A records if possible
-                    if (ns_name, dns.rdatatype.A) in CACHE:
-                        ns_response = CACHE[(ns_name, dns.rdatatype.A)]
-                    else:
-                        ns_response = lookup(dns.name.from_text(ns_name),
-                                             dns.rdatatype.A)
-                        CACHE[(ns_name, dns.rdatatype.A)] = ns_response
+                    # Check if already cached
+                    ns_resp = CACHE.get((ns_name, dns.rdatatype.A))
+                    if not ns_resp:
+                        ns_resp = lookup(dns.name.from_text(ns_name),
+                                         dns.rdatatype.A,
+                                         depth + 1)
+                        CACHE[(ns_name, dns.rdatatype.A)] = ns_resp
 
-                    for rrset in ns_response.answer:
+                    # extract resolved IPs
+                    for rrset in ns_resp.answer:
                         if rrset.rdtype == dns.rdatatype.A:
                             for rr in rrset:
-                                ipv4 = str(rr)
-                                if ipv4 and ":" not in ipv4 and ipv4 not in next_ns_ips:
-                                    next_ns_ips.append(ipv4)
+                                ip = str(rr)
+                                if ip not in next_ns_ips:
+                                    next_ns_ips.append(ip)
 
-            # --- Cache intermediate NS/A pairs for reuse ---
-            for rrset in response.authority + response.additional:
-                if rrset.rdtype == dns.rdatatype.A:
-                    for rr in rrset:
-                        CACHE[(str(rrset.name), dns.rdatatype.A)] = response
-                elif rrset.rdtype == dns.rdatatype.NS:
-                    for rr in rrset:
-                        CACHE[(str(rr.target), dns.rdatatype.A)] = response
+            # --- 4️⃣ Cache intermediate NS → IPs for future use ---
+            if response.authority:
+                for rrset in response.authority:
+                    if rrset.rdtype == dns.rdatatype.NS:
+                        zone = str(target_name.parent()).rstrip(".")
+                        CACHE.setdefault((zone, "NS"), set()).add(str(rr.target).rstrip("."))
+                        if next_ns_ips:
+                            CACHE[(zone, "NS_IPS")] = next_ns_ips
 
+            # --- 5️⃣ Go deeper if we found more nameservers ---
             if next_ns_ips:
                 nameservers = next_ns_ips
-                break  # go deeper down the tree
+                break  # go another round of resolution
 
-            # prevent infinite recursion or deep retry loops
+            # --- 6️⃣ Failsafe: prevent endless retry ---
             if len(tried) > 30:
                 empty = dns.message.make_response(query)
                 CACHE[key] = empty
                 return empty
 
         else:
-            # all servers exhausted → return empty response
+            # all nameservers exhausted
             empty = dns.message.make_response(query)
             CACHE[key] = empty
             return empty
